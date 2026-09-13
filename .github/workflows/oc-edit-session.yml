@@ -1,0 +1,65 @@
+name: OC edit session
+
+# OpenCart 1.5.4 admin runs only for the length of an editing session, restored
+# from R2 into a runner (PHP 5.6 + MySQL 5.7), reached through a Cloudflare tunnel.
+# On exit the DB + app are saved back to R2. Nothing persists in the runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel:
+        description: "Open the editing tunnel (false = restore/save only)"
+        type: boolean
+        default: true
+      export_only:
+        description: "Restore + save only, no tunnel"
+        type: boolean
+        default: false
+      idle_minutes:
+        default: "15"
+
+concurrency:
+  group: oc-edit-session
+  cancel-in-progress: false
+
+jobs:
+  session:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -proot" --health-interval=5s
+          --health-timeout=5s --health-retries=20
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      STATE_BUCKET: ${{ secrets.STATE_BUCKET }}
+      EDIT_HOST: ${{ secrets.EDIT_HOST }}
+      DB_DATABASE: ${{ secrets.DB_DATABASE }}
+      DB_PREFIX: ${{ secrets.DB_PREFIX }}
+      ADMIN_DIR: ${{ secrets.ADMIN_DIR }}
+      TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+      PAGES_PROJECT: ${{ secrets.PAGES_PROJECT }}
+      SITE_HOST: ${{ secrets.SITE_HOST }}
+      IDLE_MINUTES: ${{ inputs.idle_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '5.6'
+          extensions: mysql, gd, curl, zip, mbstring, mcrypt
+          tools: none
+      - name: Boot
+        run: bash tools/oc-boot.sh
+      - name: Session
+        if: ${{ inputs.tunnel && !inputs.export_only }}
+        run: bash tools/oc-session.sh
+      - name: Save
+        if: always()
+        run: bash tools/oc-save.sh

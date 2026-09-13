@@ -1,0 +1,51 @@
+name: OC boot test
+on:
+  workflow_dispatch:
+
+jobs:
+  boot-test:
+    runs-on: ubuntu-22.04
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -proot" --health-interval=5s
+          --health-timeout=5s --health-retries=20
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      STATE_BUCKET: ${{ secrets.STATE_BUCKET }}
+      EDIT_HOST: ${{ secrets.EDIT_HOST }}
+      DB_DATABASE: ${{ secrets.DB_DATABASE }}
+      DB_PREFIX: ${{ secrets.DB_PREFIX }}
+      ADMIN_DIR: ${{ secrets.ADMIN_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '5.6'
+          extensions: mysql, gd, curl, zip, mbstring, mcrypt
+          tools: none
+      - name: Boot OpenCart
+        run: bash tools/oc-boot.sh
+      - name: Start server + probe admin
+        run: |
+          cd webroot
+          php -S 127.0.0.1:8080 router.php >/tmp/php.log 2>&1 &
+          sleep 4
+          echo "=== admin login ==="
+          code=$(curl -s -o /tmp/admin.html -w "%{http_code}" "http://127.0.0.1:8080/admin566/index.php?route=common/login")
+          echo "HTTP $code"
+          echo "title: $(grep -oiE '<title>[^<]*' /tmp/admin.html | head -1)"
+          grep -oiE 'name="username"|name="password"|Administration|login' /tmp/admin.html | sort -u | head
+          echo "=== front home ==="
+          curl -s -o /tmp/home.html -w "front HTTP %{http_code}\n" "http://127.0.0.1:8080/index.php?route=common/home"
+          echo "title: $(grep -oiE '<title>[^<]*' /tmp/home.html | head -1)"
+          echo "=== php error log (tail) ==="
+          tail -20 /tmp/php.log || true
+          echo "=== oc error log ==="
+          tail -20 webroot/system/logs/error.log 2>/dev/null || true
