@@ -2,7 +2,8 @@ name: OC edit session
 
 # OpenCart 1.5.4 admin runs only for the length of an editing session, restored
 # from R2 into a runner (PHP 5.6 + MySQL 5.7), reached through a Cloudflare tunnel.
-# On exit the DB + app are saved back to R2. Nothing persists in the runner.
+# On exit the DB + app are saved back to R2 and the static public site is
+# re-crawled and republished to Cloudflare Pages. Nothing persists in the runner.
 
 on:
   workflow_dispatch:
@@ -17,6 +18,9 @@ on:
         default: false
       idle_minutes:
         default: "15"
+      publish_branch:
+        description: "Pages branch to republish to (main = live; anything else = a safe preview)"
+        default: "main"
 
 concurrency:
   group: oc-edit-session
@@ -43,11 +47,11 @@ jobs:
       EDIT_HOST: ${{ secrets.EDIT_HOST }}
       DB_DATABASE: ${{ secrets.DB_DATABASE }}
       DB_PREFIX: ${{ secrets.DB_PREFIX }}
-      ADMIN_DIR: ${{ secrets.ADMIN_DIR }}
       TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
       PAGES_PROJECT: ${{ secrets.PAGES_PROJECT }}
       SITE_HOST: ${{ secrets.SITE_HOST }}
       IDLE_MINUTES: ${{ inputs.idle_minutes }}
+      PUBLISH_BRANCH: ${{ inputs.publish_branch }}
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
