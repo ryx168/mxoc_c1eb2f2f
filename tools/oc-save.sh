@@ -1,89 +1,138 @@
 #!/bin/bash
-# Persist the session's changes back to R2: the database (product/text edits) and
-# the app tree (admin image uploads). Then re-crawl the front-end and republish the
-# static public site to Cloudflare Pages so edits actually show. A crawl/publish
-# failure must NOT lose the DB/app backup, so the backup happens first and the
-# republish is fully guarded (and never overwrites the live site with too few pages).
+# Persist the session's changes back to R2 (DB + app), then refresh the public
+# static site so admin edits show.
+#
+# IMPORTANT architecture note: the public site is NOT a Pages asset deployment -
+# it is the 2022 wget mirror living in the R2 bucket named like PAGES_PROJECT
+# (e.g. lilychan-ca / maxtec-inc-com), served by that Pages project's _worker.js
+# (query-URL -> R2-key mapping). So republish = re-render each page that already
+# exists in that bucket and overwrite the SAME key. We never invent keys and never
+# touch the Pages/worker deployment, so the worker's mapping can't break. (A brand
+# new product would need a new key + the page relinked - not handled here; edits to
+# existing products/pages are, which is the whole point.)
+#
+# A crawl/publish problem must never lose the DB/app backup, so the backup is first
+# and the refresh is fully guarded.
 set -uo pipefail
 cd "${GITHUB_WORKSPACE:-$PWD}/webroot"
-CF="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/r2/buckets"
+CFOBJ="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/r2/buckets"
 put() { curl -sSf -m 600 -X PUT -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: $2" --data-binary @"$1" "$3" -o /dev/null; }
 
 echo "::group::Persist DB + app to R2 (${STATE_BUCKET})"
 mysqldump -h127.0.0.1 -uroot -proot "${DB_DATABASE}" 2>/dev/null | gzip > /tmp/db.sql.gz
-put /tmp/db.sql.gz application/gzip "$CF/${STATE_BUCKET}/objects/db-latest.sql.gz" && echo "  saved db-latest.sql.gz ($(du -h /tmp/db.sql.gz|cut -f1))"
-# history copy
-put /tmp/db.sql.gz application/gzip "$CF/${STATE_BUCKET}/objects/history/db-$(date +%Y%m%d-%H%M%S).sql.gz" || true
+put /tmp/db.sql.gz application/gzip "$CFOBJ/${STATE_BUCKET}/objects/db-latest.sql.gz" && echo "  saved db-latest.sql.gz ($(du -h /tmp/db.sql.gz|cut -f1))"
+put /tmp/db.sql.gz application/gzip "$CFOBJ/${STATE_BUCKET}/objects/history/db-$(date +%Y%m%d-%H%M%S).sql.gz" || true
 tar czf /tmp/app.tar.gz --warning=no-file-changed --exclude='./system/cache/*' --exclude='./system/logs/*' --exclude='./config.php' --exclude='./admin*/config.php' . || true
-put /tmp/app.tar.gz application/gzip "$CF/${STATE_BUCKET}/objects/app.tar.gz" && echo "  saved app.tar.gz ($(du -h /tmp/app.tar.gz|cut -f1))"
+put /tmp/app.tar.gz application/gzip "$CFOBJ/${STATE_BUCKET}/objects/app.tar.gz" && echo "  saved app.tar.gz ($(du -h /tmp/app.tar.gz|cut -f1))"
 echo "::endgroup::"
 
 if [ "${SKIP_REPUBLISH:-false}" = "true" ]; then echo "SKIP_REPUBLISH set - not republishing"; exit 0; fi
 
-echo "::group::Re-crawl front-end + republish static"
+echo "::group::Refresh public static pages in R2"
+CONTENT_BUCKET="${CONTENT_BUCKET:-$PAGES_PROJECT}"
 CRAWL="http://127.0.0.1:8080"
-# OpenCart builds every link from HTTP_SERVER/HTTPS_SERVER in config.php. During a
-# session those point at EDIT_HOST so the admin works behind the tunnel - but then
-# the front-end links are all absolute to EDIT_HOST and wget (same-host only) follows
-# NONE of them, so the crawl saw just the 1 home page. For the crawl, repoint both to
-# the local server so links are same-host and the whole catalog is followed.
-# config.php is ephemeral (rewritten every boot by oc-boot.sh, and excluded from
-# app.tar.gz above), so mutating it here never affects saved state.
+# OpenCart builds links/base from HTTP_SERVER/HTTPS_SERVER; during a session they
+# point at EDIT_HOST. Repoint to the local server so the pages render with the same
+# base the mirror expects (config.php is ephemeral - rewritten each boot, excluded
+# from app.tar.gz above - so this never affects saved state).
 sed -i "s#define('HTTP_SERVER'.*#define('HTTP_SERVER', '$CRAWL/');#; s#define('HTTPS_SERVER'.*#define('HTTPS_SERVER', '$CRAWL/');#" config.php
-
-# The session's php -S (if any) may linger past a cancel; take the port cleanly.
 pkill -f "php -.*-S 127.0.0.1:8080" 2>/dev/null || true
 sleep 1
 php -d error_reporting=0 -d display_errors=0 -S 127.0.0.1:8080 router.php >/tmp/php_save.log 2>&1 &
 sleep 3
-home_code=$(curl -s -o /tmp/home.html -w "%{http_code}" "$CRAWL/")
-echo "  front home -> $home_code"
-if [ "$home_code" != "200" ]; then
-  echo "  front-end not healthy ($home_code) - keeping the existing published site. DB/app are saved."
+home_code=$(curl -s -o /tmp/home_fp.html -w "%{http_code}" "$CRAWL/")
+echo "  front home -> $home_code ($(wc -c </tmp/home_fp.html) bytes)"
+if [ "$home_code" != "200" ] || [ "$(wc -c </tmp/home_fp.html)" -lt 500 ]; then
+  echo "  front-end not healthy - keeping the existing published site. DB/app are saved."
   tail -5 /tmp/php_save.log 2>/dev/null
   exit 0
 fi
 
-OUT=/tmp/ocexport; rm -rf "$OUT"; mkdir -p "$OUT"
-# Mirror the whole linked front-end. Query-URL stores (SEO off) become
-# index.php%3Froute=...html files; SEO stores become keyword .html files - both
-# match how the live mirror was originally built (it keeps the account/checkout
-# shells too). Reject only the sort/pagination permutations that would explode the
-# crawl without adding real pages.
-wget --mirror --page-requisites --adjust-extension --convert-links --no-verbose \
-     --execute robots=off --tries=2 --timeout=25 \
-     --reject-regex '(sort=|order=|[?&]limit=|[?&]page=)' \
-     --directory-prefix "$OUT" --no-host-directories \
-     "$CRAWL/" 2>&1 | tail -3 || true
+CF_API_TOKEN="$CF_API_TOKEN" CONTENT_BUCKET="$CONTENT_BUCKET" CF_ACCOUNT_ID="$CF_ACCOUNT_ID" \
+CRAWL="$CRAWL" DRY_RUN="${DRY_RUN:-false}" MAX_KEYS="${MAX_KEYS:-0}" python3 - <<'PY'
+import os, sys, json, hashlib, urllib.request, urllib.parse, concurrent.futures as cf
 
-# Query-URL stores: wget saves files with a literal '?' and single-encoded '%2F',
-# but its own --convert-links hrefs point at the fully-encoded '%3F'/'%252F' form -
-# and Cloudflare Pages serves the query mirror directly only when the on-disk name
-# IS that encoded form (otherwise it 308-redirects). Rename files to match the hrefs
-# (encode '%'->'%25' first, then '?'->'%3F'); SEO '.html' files have no '?' and are
-# left untouched. This reproduces the original live mirror's naming exactly.
-( cd "$OUT" && find . -depth -name '*[?]*' | while IFS= read -r f; do
-    d=$(dirname "$f"); b=$(basename "$f")
-    nb=$(printf '%s' "$b" | sed 's/%/%25/g; s/?/%3F/g')
-    [ "$b" != "$nb" ] && mv -f "$f" "$d/$nb"
-  done )
+TOK   = os.environ["CF_API_TOKEN"]
+ACC   = os.environ["CF_ACCOUNT_ID"]
+BUCK  = os.environ["CONTENT_BUCKET"]
+CRAWL = os.environ["CRAWL"]
+DRY   = os.environ.get("DRY_RUN","false") == "true"
+MAXK  = int(os.environ.get("MAX_KEYS","0") or 0)
+API   = "https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects" % (ACC, BUCK)
 
-pages=$(find "$OUT" -name "*.html" | wc -l)
-echo "  crawled pages: $pages"
-MIN_PAGES="${MIN_PAGES:-5}"
-if [ "$pages" -lt "$MIN_PAGES" ]; then
-  echo "  too few pages ($pages < $MIN_PAGES) - NOT republishing (safety guard); DB/app saved."
-  exit 0
-fi
+with open("/tmp/home_fp.html","rb") as f: HOME = f.read()
+HOME_MD5 = hashlib.md5(HOME).hexdigest()
 
-BR="${PUBLISH_BRANCH:-main}"   # main = production (live custom domain); any other = a preview deploy
-echo "  deploying $pages pages to Pages project '${PAGES_PROJECT}' (branch: $BR)"
-npm i -g wrangler@4.120.1 >/tmp/wr-install.log 2>&1 || sudo npm i -g wrangler@4.120.1 >/tmp/wr-install.log 2>&1 || { echo "  wrangler install failed:"; tail -5 /tmp/wr-install.log; }
-if CLOUDFLARE_API_TOKEN="$CF_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID" \
-   wrangler pages deploy "$OUT" --project-name "${PAGES_PROJECT}" --branch "$BR" --commit-dirty=true >/tmp/pdeploy.log 2>&1; then
-  echo "  republished OK ($pages pages -> $PAGES_PROJECT, branch $BR)"
-  grep -oE 'https://[a-z0-9-]+\.pages\.dev' /tmp/pdeploy.log | tail -1 | sed 's/^/  url: /'
-else
-  echo "  republish deploy FAILED (DB + app are still safely saved):"; tail -20 /tmp/pdeploy.log
-fi
+def api_url(key):
+    return API + "/" + urllib.parse.quote(key, safe="")
+
+def list_keys():
+    keys, cur = [], None
+    while True:
+        u = API + "?per_page=1000" + (("&cursor="+urllib.parse.quote(cur,safe="")) if cur else "")
+        req = urllib.request.Request(u, headers={"Authorization":"Bearer "+TOK})
+        d = json.load(urllib.request.urlopen(req, timeout=90))
+        for o in (d.get("result") or []):
+            k = o["key"]
+            if k.endswith(".html"): keys.append(k)
+        ri = d.get("result_info") or {}
+        if ri.get("is_truncated") and ri.get("cursor"): cur = ri["cursor"]
+        else: break
+    return keys
+
+HOME_KEYS = {"index.html", "index.php%3Froute=common%2Fhome.html"}
+def key_to_path(k):
+    if k in HOME_KEYS: return ""           # the home page
+    u = k[:-5] if k.endswith(".html") else k
+    for a,b in (("%3F","?"),("%3f","?"),("%2F","/"),("%2f","/")): u = u.replace(a,b)
+    return u
+
+def fetch(path):
+    # keep URL structure, percent-encode unicode/space
+    url = CRAWL + "/" + urllib.parse.quote(path, safe="/?&=:+,")
+    req = urllib.request.Request(url, headers={"User-Agent":"oc-republish"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return r.getcode(), r.read()
+
+def put(key, body):
+    req = urllib.request.Request(api_url(key), data=body, method="PUT",
+            headers={"Authorization":"Bearer "+TOK, "Content-Type":"text/html; charset=utf-8"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.getcode()
+
+keys = list_keys()
+if MAXK: keys = keys[:MAXK]
+print("  html keys in %s: %d%s" % (BUCK, len(keys), "  (DRY RUN)" if DRY else ""))
+
+stats = {"updated":0,"unchanged":0,"skip_fetch":0,"skip_home":0,"put_fail":0}
+def work(k):
+    path = key_to_path(k)
+    try:
+        code, body = fetch(path)
+    except Exception:
+        return "skip_fetch"
+    if code != 200 or len(body) < 300:
+        return "skip_fetch"
+    # never overwrite a real page with a home-fallback render
+    if hashlib.md5(body).hexdigest() == HOME_MD5 and k not in HOME_KEYS:
+        return "skip_home"
+    if DRY:
+        return "updated"
+    try:
+        put(k, body)
+        return "updated"
+    except Exception:
+        return "put_fail"
+
+with cf.ThreadPoolExecutor(max_workers=4) as ex:
+    for r in ex.map(work, keys):
+        stats[r] = stats.get(r,0)+1
+
+print("  refreshed=%d  skipped(fetch!=ok)=%d  skipped(home-guard)=%d  put_fail=%d"
+      % (stats["updated"], stats["skip_fetch"], stats["skip_home"], stats["put_fail"]))
+# Fail loudly only if essentially nothing worked (keeps DB/app save a success either way via the outer script)
+if keys and stats["updated"] == 0:
+    print("  WARNING: no pages refreshed - investigate (keys found but none fetched/put)")
+PY
 echo "::endgroup::"
+echo "republish done for ${CONTENT_BUCKET}"
