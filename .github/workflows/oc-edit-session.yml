@@ -18,9 +18,12 @@ on:
         default: false
       idle_minutes:
         default: "15"
-      publish_branch:
-        description: "Pages branch to republish to (main = live; anything else = a safe preview)"
-        default: "main"
+      dry_run:
+        description: "Republish dry run: list + render pages but do NOT write to R2"
+        default: "false"
+      max_keys:
+        description: "Limit number of pages refreshed (0 = all); for quick tests"
+        default: "0"
 
 concurrency:
   group: oc-edit-session
@@ -51,7 +54,8 @@ jobs:
       PAGES_PROJECT: ${{ secrets.PAGES_PROJECT }}
       SITE_HOST: ${{ secrets.SITE_HOST }}
       IDLE_MINUTES: ${{ inputs.idle_minutes }}
-      PUBLISH_BRANCH: ${{ inputs.publish_branch }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      MAX_KEYS: ${{ inputs.max_keys }}
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
