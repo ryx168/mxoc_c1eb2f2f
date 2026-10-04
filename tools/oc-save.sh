@@ -47,13 +47,26 @@ fi
 OUT=/tmp/ocexport; rm -rf "$OUT"; mkdir -p "$OUT"
 # Mirror the whole linked front-end. Query-URL stores (SEO off) become
 # index.php%3Froute=...html files; SEO stores become keyword .html files - both
-# match how the live mirror was originally built. Drop only sort/pagination
-# permutations and the stateful cart/login endpoints (which can't work statically).
+# match how the live mirror was originally built (it keeps the account/checkout
+# shells too). Reject only the sort/pagination permutations that would explode the
+# crawl without adding real pages.
 wget --mirror --page-requisites --adjust-extension --convert-links --no-verbose \
      --execute robots=off --tries=2 --timeout=25 \
-     --reject-regex '(sort=|order=|limit=|[?&]page=|route=checkout|route=account/(login|logout|register|forgotten)|route=product/(search|compare)|route=affiliate)' \
+     --reject-regex '(sort=|order=|[?&]limit=|[?&]page=)' \
      --directory-prefix "$OUT" --no-host-directories \
      "$CRAWL/" 2>&1 | tail -3 || true
+
+# Query-URL stores: wget saves files with a literal '?' and single-encoded '%2F',
+# but its own --convert-links hrefs point at the fully-encoded '%3F'/'%252F' form -
+# and Cloudflare Pages serves the query mirror directly only when the on-disk name
+# IS that encoded form (otherwise it 308-redirects). Rename files to match the hrefs
+# (encode '%'->'%25' first, then '?'->'%3F'); SEO '.html' files have no '?' and are
+# left untouched. This reproduces the original live mirror's naming exactly.
+( cd "$OUT" && find . -depth -name '*[?]*' | while IFS= read -r f; do
+    d=$(dirname "$f"); b=$(basename "$f")
+    nb=$(printf '%s' "$b" | sed 's/%/%25/g; s/?/%3F/g')
+    [ "$b" != "$nb" ] && mv -f "$f" "$d/$nb"
+  done )
 
 pages=$(find "$OUT" -name "*.html" | wc -l)
 echo "  crawled pages: $pages"
