@@ -1,8 +1,9 @@
 #!/bin/bash
 # Persist the session's changes back to R2: the database (product/text edits) and
-# the app tree (admin image uploads). Then best-effort re-crawl the front-end and
-# republish the static public site so edits show. A crawl failure must NOT lose the
-# DB/app backup, so the backup happens first and the crawl is guarded.
+# the app tree (admin image uploads). Then re-crawl the front-end and republish the
+# static public site to Cloudflare Pages so edits actually show. A crawl/publish
+# failure must NOT lose the DB/app backup, so the backup happens first and the
+# republish is fully guarded (and never overwrites the live site with too few pages).
 set -uo pipefail
 cd "${GITHUB_WORKSPACE:-$PWD}/webroot"
 CF="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/r2/buckets"
@@ -13,29 +14,63 @@ mysqldump -h127.0.0.1 -uroot -proot "${DB_DATABASE}" 2>/dev/null | gzip > /tmp/d
 put /tmp/db.sql.gz application/gzip "$CF/${STATE_BUCKET}/objects/db-latest.sql.gz" && echo "  saved db-latest.sql.gz ($(du -h /tmp/db.sql.gz|cut -f1))"
 # history copy
 put /tmp/db.sql.gz application/gzip "$CF/${STATE_BUCKET}/objects/history/db-$(date +%Y%m%d-%H%M%S).sql.gz" || true
-tar czf /tmp/app.tar.gz --warning=no-file-changed --exclude='./system/cache/*' --exclude='./system/logs/*' --exclude='./config.php' --exclude='./admin566/config.php' . || true
+tar czf /tmp/app.tar.gz --warning=no-file-changed --exclude='./system/cache/*' --exclude='./system/logs/*' --exclude='./config.php' --exclude='./admin*/config.php' . || true
 put /tmp/app.tar.gz application/gzip "$CF/${STATE_BUCKET}/objects/app.tar.gz" && echo "  saved app.tar.gz ($(du -h /tmp/app.tar.gz|cut -f1))"
 echo "::endgroup::"
 
 if [ "${SKIP_REPUBLISH:-false}" = "true" ]; then echo "SKIP_REPUBLISH set - not republishing"; exit 0; fi
 
-echo "::group::Re-crawl front-end + republish static (best effort)"
+echo "::group::Re-crawl front-end + republish static"
+CRAWL="http://127.0.0.1:8080"
+# OpenCart builds every link from HTTP_SERVER/HTTPS_SERVER in config.php. During a
+# session those point at EDIT_HOST so the admin works behind the tunnel - but then
+# the front-end links are all absolute to EDIT_HOST and wget (same-host only) follows
+# NONE of them, so the crawl saw just the 1 home page. For the crawl, repoint both to
+# the local server so links are same-host and the whole catalog is followed.
+# config.php is ephemeral (rewritten every boot by oc-boot.sh, and excluded from
+# app.tar.gz above), so mutating it here never affects saved state.
+sed -i "s#define('HTTP_SERVER'.*#define('HTTP_SERVER', '$CRAWL/');#; s#define('HTTPS_SERVER'.*#define('HTTPS_SERVER', '$CRAWL/');#" config.php
+
+# The session's php -S (if any) may linger past a cancel; take the port cleanly.
+pkill -f "php -.*-S 127.0.0.1:8080" 2>/dev/null || true
+sleep 1
 php -d error_reporting=0 -d display_errors=0 -S 127.0.0.1:8080 router.php >/tmp/php_save.log 2>&1 &
 sleep 3
-home_code=$(curl -s -o /tmp/home.html -w "%{http_code}" "http://127.0.0.1:8080/index.php?route=common/home")
+home_code=$(curl -s -o /tmp/home.html -w "%{http_code}" "$CRAWL/")
 echo "  front home -> $home_code"
 if [ "$home_code" != "200" ]; then
-  echo "  front-end not healthy ($home_code) - keeping the existing published static site. DB/app are saved."
+  echo "  front-end not healthy ($home_code) - keeping the existing published site. DB/app are saved."
+  tail -5 /tmp/php_save.log 2>/dev/null
   exit 0
 fi
+
 OUT=/tmp/ocexport; rm -rf "$OUT"; mkdir -p "$OUT"
-# Crawl the SEO/front pages. OpenCart links are absolute to EDIT_HOST; rewrite to relative for the crawl.
+# Mirror the whole linked front-end. Query-URL stores (SEO off) become
+# index.php%3Froute=...html files; SEO stores become keyword .html files - both
+# match how the live mirror was originally built. Drop only sort/pagination
+# permutations and the stateful cart/login endpoints (which can't work statically).
 wget --mirror --page-requisites --adjust-extension --convert-links --no-verbose \
-     --execute robots=off --tries=2 --timeout=25 --reject "*checkout*,*login*,*cart*,*account*" \
+     --execute robots=off --tries=2 --timeout=25 \
+     --reject-regex '(sort=|order=|limit=|[?&]page=|route=checkout|route=account/(login|logout|register|forgotten)|route=product/(search|compare)|route=affiliate)' \
      --directory-prefix "$OUT" --no-host-directories \
-     "http://127.0.0.1:8080/index.php?route=common/home" 2>&1 | tail -3 || true
+     "$CRAWL/" 2>&1 | tail -3 || true
+
 pages=$(find "$OUT" -name "*.html" | wc -l)
 echo "  crawled pages: $pages"
-if [ "$pages" -lt 5 ]; then echo "  too few pages ($pages) - not republishing; DB/app saved."; exit 0; fi
-echo "  (republish upload to ${PAGES_PROJECT} left to the maintainer for now - crawl produced $pages pages at $OUT)"
+MIN_PAGES="${MIN_PAGES:-5}"
+if [ "$pages" -lt "$MIN_PAGES" ]; then
+  echo "  too few pages ($pages < $MIN_PAGES) - NOT republishing (safety guard); DB/app saved."
+  exit 0
+fi
+
+BR="${PUBLISH_BRANCH:-main}"   # main = production (live custom domain); any other = a preview deploy
+echo "  deploying $pages pages to Pages project '${PAGES_PROJECT}' (branch: $BR)"
+npm i -g wrangler@4.120.1 >/tmp/wr-install.log 2>&1 || sudo npm i -g wrangler@4.120.1 >/tmp/wr-install.log 2>&1 || { echo "  wrangler install failed:"; tail -5 /tmp/wr-install.log; }
+if CLOUDFLARE_API_TOKEN="$CF_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID" \
+   wrangler pages deploy "$OUT" --project-name "${PAGES_PROJECT}" --branch "$BR" --commit-dirty=true >/tmp/pdeploy.log 2>&1; then
+  echo "  republished OK ($pages pages -> $PAGES_PROJECT, branch $BR)"
+  grep -oE 'https://[a-z0-9-]+\.pages\.dev' /tmp/pdeploy.log | tail -1 | sed 's/^/  url: /'
+else
+  echo "  republish deploy FAILED (DB + app are still safely saved):"; tail -20 /tmp/pdeploy.log
+fi
 echo "::endgroup::"
