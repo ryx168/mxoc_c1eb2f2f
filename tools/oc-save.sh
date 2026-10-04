@@ -60,6 +60,11 @@ DRY   = os.environ.get("DRY_RUN","false") == "true"
 MAXK  = int(os.environ.get("MAX_KEYS","0") or 0)
 API   = "https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects" % (ACC, BUCK)
 
+import re
+def title_of(b):
+    m = re.search(br"<title>(.*?)</title>", b, re.I|re.S)
+    return (m.group(1).decode("utf-8","replace").strip() if m else "")[:60]
+
 with open("/tmp/home_fp.html","rb") as f: HOME = f.read()
 HOME_MD5 = hashlib.md5(HOME).hexdigest()
 
@@ -100,39 +105,51 @@ def put(key, body):
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.getcode()
 
+# not-found fingerprint: ask OpenCart for a route that cannot exist
+try:
+    _, nfb = fetch("index.php?route=zz_nonexistent/zz_" + hashlib.md5(b"x").hexdigest())
+    NF_MD5 = hashlib.md5(nfb).hexdigest(); NF_TITLE = title_of(nfb).lower()
+except Exception:
+    NF_MD5 = ""; NF_TITLE = "\x00"
+print("  home='%s'  not_found='%s'" % (title_of(HOME), NF_TITLE))
+
 keys = list_keys()
 if MAXK: keys = keys[:MAXK]
 print("  html keys in %s: %d%s" % (BUCK, len(keys), "  (DRY RUN)" if DRY else ""))
 
-stats = {"updated":0,"unchanged":0,"skip_fetch":0,"skip_home":0,"put_fail":0}
+samples = []
 def work(k):
     path = key_to_path(k)
     try:
         code, body = fetch(path)
     except Exception:
-        return "skip_fetch"
+        return ("skip_fetch", k, 0, "")
+    t = title_of(body); md5 = hashlib.md5(body).hexdigest()
     if code != 200 or len(body) < 300:
-        return "skip_fetch"
-    # never overwrite a real page with a home-fallback render
-    if hashlib.md5(body).hexdigest() == HOME_MD5 and k not in HOME_KEYS:
-        return "skip_home"
-    if DRY:
-        return "updated"
-    try:
-        put(k, body)
-        return "updated"
-    except Exception:
-        return "put_fail"
+        return ("skip_fetch", k, code, t)
+    if md5 == HOME_MD5 and k not in HOME_KEYS:
+        return ("skip_home", k, code, t)
+    if (NF_MD5 and md5 == NF_MD5) or ("not found" in t.lower()) or ("404" in t):
+        return ("skip_notfound", k, code, t)
+    if not DRY:
+        try: put(k, body)
+        except Exception: return ("put_fail", k, code, t)
+    return ("updated", k, code, t)
 
+stats = {}
 with cf.ThreadPoolExecutor(max_workers=4) as ex:
-    for r in ex.map(work, keys):
-        stats[r] = stats.get(r,0)+1
+    for res in ex.map(work, keys):
+        st = res[0]; stats[st] = stats.get(st,0)+1
+        if len(samples) < 24: samples.append(res)
 
-print("  refreshed=%d  skipped(fetch!=ok)=%d  skipped(home-guard)=%d  put_fail=%d"
-      % (stats["updated"], stats["skip_fetch"], stats["skip_home"], stats["put_fail"]))
-# Fail loudly only if essentially nothing worked (keeps DB/app save a success either way via the outer script)
-if keys and stats["updated"] == 0:
-    print("  WARNING: no pages refreshed - investigate (keys found but none fetched/put)")
+print("  refreshed=%d  skip_fetch=%d  skip_home=%d  skip_notfound=%d  put_fail=%d" % (
+    stats.get("updated",0), stats.get("skip_fetch",0), stats.get("skip_home",0),
+    stats.get("skip_notfound",0), stats.get("put_fail",0)))
+print("  --- sample (status | code | title | key) ---")
+for st,k,code,t in samples:
+    print("    %-13s %s | %-22s | %s" % (st, code, (t or "")[:22], k[:70]))
+if keys and stats.get("updated",0) == 0:
+    print("  WARNING: no pages refreshed - investigate")
 PY
 echo "::endgroup::"
 echo "republish done for ${CONTENT_BUCKET}"
