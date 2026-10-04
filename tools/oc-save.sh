@@ -48,6 +48,60 @@ if [ "$home_code" != "200" ] || [ "$(wc -c </tmp/home_fp.html)" -lt 500 ]; then
   exit 0
 fi
 
+if [ "${REPUBLISH_MODE:-refresh}" = "full" ]; then
+  # FULL re-crawl: wget-mirror the live front-end (internally-consistent links,
+  # correct UTF-8 filenames on this UTF-8 runner) and upload EVERY file to the R2
+  # content bucket under the worker's key scheme (relpath, '?'->'%3F'). Additive -
+  # never deletes existing keys. Use this to repair an incomplete/mojibake mirror
+  # (e.g. maxtec's missing deep-catalog pages).
+  OUT=/tmp/ocmirror; rm -rf "$OUT"; mkdir -p "$OUT"
+  echo "  full crawl (wget --mirror) ..."
+  wget --mirror --page-requisites --adjust-extension --convert-links --no-verbose \
+       --execute robots=off --tries=2 --timeout=25 \
+       --reject-regex '(sort=|order=|[?&]limit=|[?&]page=|route=checkout|route=account|route=product/compare)' \
+       --directory-prefix "$OUT" --no-host-directories "$CRAWL/" 2>/tmp/wget.log || true
+  echo "  files crawled: $(find "$OUT" -type f | wc -l)  ($(find "$OUT" -name '*.html' | wc -l) html)"
+  CF_API_TOKEN="$CF_API_TOKEN" CONTENT_BUCKET="$CONTENT_BUCKET" CF_ACCOUNT_ID="$CF_ACCOUNT_ID" \
+  OUT="$OUT" DRY_RUN="${DRY_RUN:-false}" python3 - <<'PYF'
+import os,sys,urllib.request,urllib.parse,unicodedata,mimetypes,concurrent.futures as cf
+TOK=os.environ["CF_API_TOKEN"];ACC=os.environ["CF_ACCOUNT_ID"];BUCK=os.environ["CONTENT_BUCKET"]
+OUT=os.environ["OUT"];DRY=os.environ.get("DRY_RUN")=="true"
+API="https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects"%(ACC,BUCK)
+def key_of(rel):
+    # wget saved '?' literally and '/' in query as %2F; the worker/key scheme uses
+    # '?'->'%3F' and keeps '/' (real dir sep) and '%2F'. Just encode the '?'.
+    k=rel.replace("?","%3F")
+    return unicodedata.normalize("NFC",k)
+def put(rel):
+    full=os.path.join(OUT,rel)
+    with open(full,"rb") as f: body=f.read()
+    if len(body)==0: return "empty"
+    k=key_of(rel)
+    ct=mimetypes.guess_type(k)[0] or "application/octet-stream"
+    if k.endswith(".html"): ct="text/html; charset=utf-8"
+    if DRY: return "would"
+    u=API+"/"+urllib.parse.quote(k,safe="")
+    r=urllib.request.Request(u,data=body,method="PUT",headers={"Authorization":"Bearer "+TOK,"Content-Type":ct})
+    try:
+        urllib.request.urlopen(r,timeout=120); return "put"
+    except Exception as e:
+        return "fail"
+rels=[]
+for root,_,files in os.walk(OUT):
+    for fn in files:
+        rels.append(os.path.relpath(os.path.join(root,fn),OUT).replace(os.sep,"/"))
+print("  uploading %d files%s ..."%(len(rels)," (DRY)" if DRY else ""))
+from collections import Counter
+c=Counter()
+with cf.ThreadPoolExecutor(max_workers=8) as ex:
+    for r in ex.map(put,rels): c[r]+=1
+print("  upload: put=%d would=%d empty=%d fail=%d"%(c["put"],c["would"],c["empty"],c["fail"]))
+PYF
+  echo "::endgroup::"
+  echo "republish(full) done for ${CONTENT_BUCKET}"
+  exit 0
+fi
+
 CF_API_TOKEN="$CF_API_TOKEN" CONTENT_BUCKET="$CONTENT_BUCKET" CF_ACCOUNT_ID="$CF_ACCOUNT_ID" \
 CRAWL="$CRAWL" DRY_RUN="${DRY_RUN:-false}" MAX_KEYS="${MAX_KEYS:-0}" python3 - <<'PY'
 import os, sys, json, hashlib, urllib.request, urllib.parse, concurrent.futures as cf
