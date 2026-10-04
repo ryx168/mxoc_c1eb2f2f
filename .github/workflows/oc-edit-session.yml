@@ -24,6 +24,9 @@ on:
       max_keys:
         description: "Limit number of pages refreshed (0 = all); for quick tests"
         default: "0"
+      republish_mode:
+        description: "refresh = re-render existing R2 keys; full = wget-mirror the whole store and upload all pages (repairs an incomplete mirror)"
+        default: "refresh"
 
 concurrency:
   group: oc-edit-session
@@ -56,6 +59,7 @@ jobs:
       IDLE_MINUTES: ${{ inputs.idle_minutes }}
       DRY_RUN: ${{ inputs.dry_run }}
       MAX_KEYS: ${{ inputs.max_keys }}
+      REPUBLISH_MODE: ${{ inputs.republish_mode }}
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
