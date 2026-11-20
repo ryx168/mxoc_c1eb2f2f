@@ -9,9 +9,16 @@ rm -rf "$ROOT"; mkdir -p "$ROOT"; cd "$ROOT"
 CF="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/r2/buckets/${STATE_BUCKET}/objects"
 
 echo "::group::Restore state from R2"
-curl -sSf -H "Authorization: Bearer ${CF_API_TOKEN}" "$CF/app.tar.gz" -o app.tar.gz
-tar xzf app.tar.gz && rm -f app.tar.gz
-curl -sSf -H "Authorization: Bearer ${CF_API_TOKEN}" "$CF/db-latest.sql.gz" -o db.sql.gz
+# No `set -e` in this script, so each restore command must fail the step by
+# itself. Before this, a failed download (e.g. 401 from a dead CF_API_TOKEN)
+# let tar/import fail quietly and the step could still report success - which
+# made the workflow's "save only after a good restore" gate meaningless.
+curl -sSf -H "Authorization: Bearer ${CF_API_TOKEN}" "$CF/app.tar.gz" -o app.tar.gz \
+  || { echo "::error::restore failed: could not download app.tar.gz"; exit 1; }
+tar xzf app.tar.gz && rm -f app.tar.gz \
+  || { echo "::error::restore failed: could not unpack app.tar.gz"; exit 1; }
+curl -sSf -H "Authorization: Bearer ${CF_API_TOKEN}" "$CF/db-latest.sql.gz" -o db.sql.gz \
+  || { echo "::error::restore failed: could not download db-latest.sql.gz"; exit 1; }
 echo "  app + db restored; top: $(ls | tr '\n' ' ')"
 echo "::endgroup::"
 
@@ -21,7 +28,8 @@ for i in $(seq 1 45); do
   echo "  waiting for mysql ($i)"; sleep 2
 done
 mysql -h127.0.0.1 -uroot -proot -e "CREATE DATABASE IF NOT EXISTS ${DB_DATABASE} CHARACTER SET utf8 COLLATE utf8_general_ci;"
-zcat db.sql.gz | mysql -h127.0.0.1 -uroot -proot "${DB_DATABASE}" && echo "  imported db"
+zcat db.sql.gz | mysql -h127.0.0.1 -uroot -proot "${DB_DATABASE}" && echo "  imported db" \
+  || { echo "::error::restore failed: database import did not complete"; exit 1; }
 rm -f db.sql.gz
 echo "  products: $(mysql -h127.0.0.1 -uroot -proot -N -e "SELECT COUNT(*) FROM ${DB_DATABASE}.${DB_PREFIX}product" 2>/dev/null)"
 echo "::endgroup::"
