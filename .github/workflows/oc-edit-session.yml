@@ -68,10 +68,17 @@ jobs:
           extensions: mysql, gd, curl, zip, mbstring, mcrypt
           tools: none
       - name: Boot
+        # id so the save step can tell whether the restore actually completed.
+        id: boot
         run: bash tools/oc-boot.sh
       - name: Session
         if: ${{ inputs.tunnel && !inputs.export_only }}
         run: bash tools/oc-session.sh
       - name: Save
-        if: always()
+        # always() so a cancelled or timed-out session still saves - but ONLY
+        # once the restore has completed. oc-save.sh uploads whatever mysqldump
+        # produced (errors hidden, no emptiness check), so running it after a
+        # failed restore could overwrite db-latest.sql.gz / app.tar.gz in R2.
+        # outcome (not conclusion) so a restore cancelled part-way also skips.
+        if: ${{ always() && steps.boot.outcome == 'success' }}
         run: bash tools/oc-save.sh
