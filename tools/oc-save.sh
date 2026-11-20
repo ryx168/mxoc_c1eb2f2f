@@ -14,12 +14,25 @@
 # A crawl/publish problem must never lose the DB/app backup, so the backup is first
 # and the refresh is fully guarded.
 set -uo pipefail
-cd "${GITHUB_WORKSPACE:-$PWD}/webroot"
+cd "${GITHUB_WORKSPACE:-$PWD}/webroot" \
+  || { echo "::error::webroot is missing - the restore never happened; NOT saving"; exit 1; }
 CFOBJ="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/r2/buckets"
 put() { curl -sSf -m 600 -X PUT -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: $2" --data-binary @"$1" "$3" -o /dev/null; }
 
 echo "::group::Persist DB + app to R2 (${STATE_BUCKET})"
-mysqldump -h127.0.0.1 -uroot -proot "${DB_DATABASE}" 2>/dev/null | gzip > /tmp/db.sql.gz
+# Dump to a FILE and check it before anything is uploaded. The old form
+# (`mysqldump 2>/dev/null | gzip > db.sql.gz`) hid every error and, under pipefail
+# with no `-e`, passed on a tiny valid .gz even when MySQL was dead or the
+# database empty - which the next line then uploaded over db-latest.sql.gz.
+if ! mysqldump -h127.0.0.1 -uroot -proot "${DB_DATABASE}" > /tmp/db.sql 2> /tmp/dump.err; then
+  echo "::error::mysqldump failed - NOT saving over db-latest.sql.gz: $(head -c 300 /tmp/dump.err)"
+  exit 1
+fi
+if ! grep -q "CREATE TABLE \`${DB_PREFIX:-}product\`" /tmp/db.sql; then
+  echo "::error::the dump has no ${DB_PREFIX:-}product table ($(wc -c < /tmp/db.sql) bytes) - NOT saving"
+  exit 1
+fi
+gzip -c /tmp/db.sql > /tmp/db.sql.gz
 put /tmp/db.sql.gz application/gzip "$CFOBJ/${STATE_BUCKET}/objects/db-latest.sql.gz" && echo "  saved db-latest.sql.gz ($(du -h /tmp/db.sql.gz|cut -f1))"
 put /tmp/db.sql.gz application/gzip "$CFOBJ/${STATE_BUCKET}/objects/history/db-$(date +%Y%m%d-%H%M%S).sql.gz" || true
 tar czf /tmp/app.tar.gz --warning=no-file-changed --exclude='./system/cache/*' --exclude='./system/logs/*' --exclude='./config.php' --exclude='./admin*/config.php' . || true
