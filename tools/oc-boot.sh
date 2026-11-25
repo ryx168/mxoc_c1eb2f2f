@@ -62,7 +62,7 @@ define('DIR_LANGUAGE', '$ROOT/catalog/language/');
 define('DIR_TEMPLATE', '$ROOT/catalog/view/theme/');
 $(common_dirs)
 EOF
-AD="${ADMIN_DIR:-admin566}"
+AD="${ADMIN_DIR:-admin137858}"
 cat > "$AD/config.php" <<EOF
 <?php
 define('HTTP_SERVER', 'https://$EH/$AD/');
